@@ -34,6 +34,7 @@ const (
 )
 
 type FileInfo struct {
+	Id      int
 	Path    string
 	Source  []byte
 	Package *PackageInfo
@@ -210,44 +211,51 @@ func (file *FileInfo) addSourceChange(sc *SourceChange, at token.Pos) {
 	file.Changes[at] = sc
 }
 
+func getParent(path []ast.Node) (ast.Node, token.Pos) {
+	for i := len(path) - 1; i >= 0; i-- {
+		node := path[i]
+		switch stmt := node.(type) {
+		case *ast.BlockStmt:
+			// Block is  a part of switch-like structure, add before instead
+			if i > 0 && isSpecialBlock(path[i-1]) {
+				continue
+			}
+			return stmt, stmt.Lbrace + 1
+		case *ast.CommClause:
+			return stmt, stmt.Colon + 1
+		case *ast.CaseClause:
+			return stmt, stmt.Colon + 1
+		}
+	}
+	return nil, 0
+}
+
 func (file *FileInfo) addInstrumentationGo() {
-	visited := make(map[*ast.BlockStmt]bool)
-	var parentBlock *ast.BlockStmt = nil
-	var blockOwner ast.Node
+	visited := make(map[ast.Node]bool)
+	path := []ast.Node{}
 	astWalk := func(node ast.Node) bool {
 		if node == nil {
+			path = path[:len(path)-1]
 			return false
 		}
-
-		switch node.(type) {
-		case *ast.RangeStmt, *ast.ForStmt, *ast.SelectStmt, *ast.TypeSwitchStmt,
-			*ast.SwitchStmt, *ast.IfStmt, *ast.FuncDecl:
-			defer func() { blockOwner = node }()
-		}
-
-		// Switch stmt gets messed up
-		if decl, ok := node.(*ast.BlockStmt); ok {
-			defer func() {
-				if isSpecialBlock(blockOwner) {
-					return
-				}
-				parentBlock = decl
-			}()
-		}
-
+		path = append(path, node)
 		// if this node has mutations we will instrument the enclosing block to check reachability at runtime
-		if match := hasMutation(node, DEFAULT_MUTATORS); !match || parentBlock == nil {
+		if match := hasMutation(node, DEFAULT_MUTATORS); !match {
+			return true
+		}
+
+		parentNode, at := getParent(path)
+		if parentNode == nil {
 			return true
 		}
 
 		// block not already visited
-		if !visited[parentBlock] {
-			visited[parentBlock] = true
+		if !visited[parentNode] {
+			visited[parentNode] = true
 			// Create __reach("BLOCK_ID:FILEPATH") call
-			reach := fmt.Sprintf(`__reach("%d:%s", false);`, len(visited), file.Path)
-			// reach, _ := parser.ParseExpr(reachSrc)
-			// parentBlock.List = append([]ast.Stmt{&ast.ExprStmt{X: reach}}, parentBlock.List...)
-			file.addSourceChange(&SourceChange{SC_APPEND, reach, parentBlock.Rbrace + 1}, parentBlock.Lbrace+1)
+			reach := fmt.Sprintf(`__reach("R %d:%d", false);`, file.Id, parentNode.Pos())
+
+			file.addSourceChange(&SourceChange{SC_APPEND, reach, parentNode.End()}, at)
 		}
 		return false
 	}
@@ -284,7 +292,7 @@ func (file *FileInfo) addInstrumentationTEST() {
 			}
 		}
 		if hasTest {
-			reach := fmt.Sprintf(`__reach("TEST %s:%s", true)`, file.Path, fun.Name.Name)
+			reach := fmt.Sprintf(`__reach("T %d:%d", true)`, file.Id, fun.Pos())
 			// reach, _ := parser.ParseExpr(reachSrc)
 			// fun.Body.List = append([]ast.Stmt{&ast.ExprStmt{X: reach}}, fun.Body.List...)
 			file.addSourceChange(&SourceChange{SC_APPEND, reach, fun.Body.Rbrace + 1}, fun.Body.Lbrace+1)
@@ -320,7 +328,7 @@ func (file *FileInfo) writeChanges() {
 }
 
 // Adds the __reach function on the file at goFilePath
-func NewFileInfo(path string, pack *PackageInfo) *FileInfo {
+func (i *Instrumenter) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 	var fs token.FileSet
 	var err error
 
@@ -343,34 +351,57 @@ func NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 		file.Imports[spec.Path.Value] = true
 	}
 
+	file.Id = len(i.Files)
+	i.Files = append(i.Files, &file)
 	return &file
 }
 
-func instrumentPackage(p *PackageInfo) {
+func (i *Instrumenter) instrumentPackage(p *PackageInfo) bool {
 	// FIXME: Check before copying project
 	if len(p.TestGoFiles) == 0 {
 		fmt.Printf("?\t%s\t[no test files]\n", p.ImportPath)
-		return
+		// return false
 	} else if len(p.GoFiles) == 0 {
 		fmt.Printf("?\t%s\t[no .go files]\n", p.ImportPath)
-		return
+		return false
 	}
 
 	for _, source := range p.GoFiles {
-		file := NewFileInfo(p.Dir+"/"+source, p)
+		file := i.NewFileInfo(p.Dir+"/"+source, p)
 		file.addInstrumentationGo()
 		file.writeChanges()
 	}
 	for _, source := range p.TestGoFiles {
-		file := NewFileInfo(p.Dir+"/"+source, p)
+		file := i.NewFileInfo(p.Dir+"/"+source, p)
 		file.addInstrumentationTEST()
 		file.writeChanges()
 	}
+	return true
+}
+
+type Instrumenter struct {
+	Files []*FileInfo
 }
 
 func mutateAndRun() {
-	for _, p := range packageInfo() {
-		instrumentPackage(&p)
+	i := Instrumenter{}
+	for _, p := range packageInfo()[1:] {
+		shouldCompute := i.instrumentPackage(&p)
+		if !shouldCompute {
+			return
+		}
+
+		// fmt.Println("computing mutation reach >> go test " + p.ImportPath)
+		// err := exec.Command("go", "test", p.ImportPath).Run()
+		// if err != nil {
+		// 	panic(err)
+		// }
+		// data, err := os.ReadFile("reach.log")
+		// if err != nil {
+		// 	panic(err)
+		// }
+		// strData := string(data)
+		// fmt.Print(strData)
 	}
 }
 
