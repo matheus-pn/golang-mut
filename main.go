@@ -72,10 +72,23 @@ func __reach(msg string, flush bool) {
 `
 )
 
+// Yao, Xiangjuan; Harman, Mark; Jia, Yue  (2014).
+// [ACM Press the 36th International Conference - Hyderabad, India (2014.05.31-2014.06.07)]
+// Proceedings of the 36th International Conference on Software Engineering
+// - ICSE 2014 - A study of equivalent and stubborn mutation operators using human analysis of equivalence.
+// , (), 919–930.
+// doi:10.1145/2568225.2568265
 var (
-	DEFAULT_MUTATORS = []Mutator{Incrementer{}}
-	TMP_ROOT         string
-	FLAGS            = map[string]string{
+	DEFAULT_MUTATORS = []Mutator{
+		UOIIncrementer{},
+		UOIDecrementer{},
+
+		AORMinusToDiv{},
+		AORModToAdd{},
+		AORModToSub{},
+	}
+	TMP_ROOT string
+	FLAGS    = map[string]string{
 		"verbose": "false",
 	}
 )
@@ -176,9 +189,9 @@ func removeProjectCopy(directory string) {
 
 var ONE = ast.BasicLit{ValuePos: token.NoPos, Kind: token.INT, Value: "1"}
 
-type Incrementer struct{}
+type UOIIncrementer struct{}
 
-func (Incrementer) replacement(orig ast.Node) ast.Node {
+func (UOIIncrementer) replacement(orig ast.Node) ast.Node {
 	node, ok := orig.(*ast.BasicLit)
 	if !ok {
 		return nil
@@ -188,6 +201,47 @@ func (Incrementer) replacement(orig ast.Node) ast.Node {
 	}
 
 	return &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.ADD, Y: &ONE}
+}
+
+type UOIDecrementer struct{}
+
+func (UOIDecrementer) replacement(orig ast.Node) ast.Node {
+	node, ok := orig.(*ast.BasicLit)
+	if !ok {
+		return nil
+	}
+	if node.Kind != token.FLOAT && node.Kind != token.INT {
+		return nil
+	}
+
+	return &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.SUB, Y: &ONE}
+}
+
+func operatorReplacement(orig ast.Node, op token.Token, newOp token.Token) ast.Node {
+	node, ok := orig.(*ast.BinaryExpr)
+	if !ok || node.Op != op {
+		return nil
+	}
+
+	return &ast.BinaryExpr{X: node.X, OpPos: token.NoPos, Op: newOp, Y: node.Y}
+}
+
+type AORMinusToDiv struct{}
+
+func (AORMinusToDiv) replacement(orig ast.Node) ast.Node {
+	return operatorReplacement(orig, token.SUB, token.QUO)
+}
+
+type AORModToAdd struct{}
+
+func (AORModToAdd) replacement(orig ast.Node) ast.Node {
+	return operatorReplacement(orig, token.REM, token.ADD)
+}
+
+type AORModToSub struct{}
+
+func (AORModToSub) replacement(orig ast.Node) ast.Node {
+	return operatorReplacement(orig, token.REM, token.SUB)
 }
 
 // func schemata[T any](toggle string, origEx T, replaceEx ...T) T {
