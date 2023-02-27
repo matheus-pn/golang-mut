@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,7 +23,6 @@ type PackageInfo struct {
 
 type Mutator interface {
 	replacement(ast.Node) ast.Node
-	match(ast.Node) bool
 }
 
 type ChangeMode int
@@ -38,9 +38,11 @@ type FileInfo struct {
 	Path    string
 	Source  []byte
 	Package *PackageInfo
-	Changes map[token.Pos]*SourceChange
 	AST     *ast.File
 	Imports map[string]bool
+	// Mutations per block
+	Mutations map[token.Pos][]ast.Node
+	Changes   map[token.Pos]*SourceChange
 }
 
 // Even parsing with comments still can mess compiler directives
@@ -79,7 +81,10 @@ var (
 )
 
 // FIXME: Use only packages.Load instead of go list
-func packageInfo() []PackageInfo {
+func packageInfo(pkg string) []PackageInfo {
+	if pkg == "" {
+		pkg = "./..."
+	}
 	// Output will be a series of lines
 	// each line will have a semicolon separated list of:
 	// Dir ; ImportPath ; GoFiles ; TestGofiles
@@ -88,7 +93,7 @@ func packageInfo() []PackageInfo {
 	out, err := exec.Command(
 		"go", "list", "-f",
 		"{{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}}",
-		"./...",
+		pkg,
 	).Output()
 	if err != nil {
 		panic(err)
@@ -116,9 +121,12 @@ func packageInfo() []PackageInfo {
 	return infoList
 }
 
-func checkGolist() {
+func checkGolist(pkg string) {
+	if pkg == "" {
+		pkg = "."
+	}
 	Verbosef("EXEC go list .\n")
-	err := exec.Command("go", "list", ".").Run()
+	err := exec.Command("go", "list", pkg).Run()
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
@@ -182,21 +190,19 @@ func (Incrementer) replacement(orig ast.Node) ast.Node {
 	return &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.ADD, Y: &ONE}
 }
 
-func (i Incrementer) match(orig ast.Node) bool {
-	return i.replacement(orig) != nil
-}
-
 // func schemata[T any](toggle string, origEx T, replaceEx ...T) T {
 // 	return origEx
 // }
 
-func hasMutation(node ast.Node, mutators []Mutator) bool {
+func mutations(node ast.Node, mutators []Mutator) []ast.Node {
+	changes := []ast.Node{}
 	for _, mut := range mutators {
-		if mut.match(node) {
-			return true
+		change := mut.replacement(node)
+		if change != nil {
+			changes = append(changes, change)
 		}
 	}
-	return false
+	return changes
 }
 
 func isSpecialBlock(node ast.Node) bool {
@@ -239,8 +245,10 @@ func (file *FileInfo) addInstrumentationGo() {
 			return false
 		}
 		path = append(path, node)
+
 		// if this node has mutations we will instrument the enclosing block to check reachability at runtime
-		if match := hasMutation(node, DEFAULT_MUTATORS); !match {
+		changes := mutations(node, DEFAULT_MUTATORS)
+		if len(changes) == 0 {
 			return true
 		}
 
@@ -248,6 +256,9 @@ func (file *FileInfo) addInstrumentationGo() {
 		if parentNode == nil {
 			return true
 		}
+
+		m := file.Mutations[parentNode.Pos()]
+		file.Mutations[parentNode.Pos()] = append(m, changes...)
 
 		// block not already visited
 		if !visited[parentNode] {
@@ -257,7 +268,7 @@ func (file *FileInfo) addInstrumentationGo() {
 
 			file.addSourceChange(&SourceChange{SC_APPEND, reach, parentNode.End()}, at)
 		}
-		return false
+		return true
 	}
 	ast.Inspect(file.AST, astWalk)
 }
@@ -302,10 +313,12 @@ func (file *FileInfo) addInstrumentationTEST() {
 	ast.Inspect(file.AST, astWalk)
 }
 
-func (file *FileInfo) writeChanges() {
+func (file *FileInfo) writeChanges(defineReach bool) {
 	if len(file.Changes) == 0 {
+		os.WriteFile(file.Path, []byte(file.Source), 0777)
 		return
 	}
+
 	writer := bytes.Buffer{}
 	for i := 0; i < len(file.Source); i++ {
 		if i == int(file.AST.Name.End()) && !file.Imports[`"os"`] && !file.Package.ReachDefined {
@@ -320,11 +333,14 @@ func (file *FileInfo) writeChanges() {
 		}
 		writer.WriteByte(file.Source[i])
 	}
-	if !file.Package.ReachDefined {
+
+	if defineReach && !file.Package.ReachDefined {
 		fmt.Fprintf(&writer, REACH_DEFINITION, TMP_ROOT)
 		file.Package.ReachDefined = true
 	}
+
 	os.WriteFile(file.Path, writer.Bytes(), 0777)
+	file.Changes = nil
 }
 
 // Adds the __reach function on the file at goFilePath
@@ -334,7 +350,7 @@ func (i *Instrumenter) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 
 	file := FileInfo{
 		Path: path, Package: pack, Changes: make(map[token.Pos]*SourceChange),
-		Imports: make(map[string]bool),
+		Imports: make(map[string]bool), Mutations: make(map[token.Pos][]ast.Node),
 	}
 
 	file.Source, err = os.ReadFile(path)
@@ -360,7 +376,7 @@ func (i *Instrumenter) instrumentPackage(p *PackageInfo) bool {
 	// FIXME: Check before copying project
 	if len(p.TestGoFiles) == 0 {
 		fmt.Printf("?\t%s\t[no test files]\n", p.ImportPath)
-		// return false
+		return false
 	} else if len(p.GoFiles) == 0 {
 		fmt.Printf("?\t%s\t[no .go files]\n", p.ImportPath)
 		return false
@@ -369,12 +385,12 @@ func (i *Instrumenter) instrumentPackage(p *PackageInfo) bool {
 	for _, source := range p.GoFiles {
 		file := i.NewFileInfo(p.Dir+"/"+source, p)
 		file.addInstrumentationGo()
-		file.writeChanges()
+		file.writeChanges(true)
 	}
 	for _, source := range p.TestGoFiles {
 		file := i.NewFileInfo(p.Dir+"/"+source, p)
 		file.addInstrumentationTEST()
-		file.writeChanges()
+		file.writeChanges(true)
 	}
 	return true
 }
@@ -383,42 +399,74 @@ type Instrumenter struct {
 	Files []*FileInfo
 }
 
-func mutateAndRun() {
+func (i *Instrumenter) getMutations() {
+	data, err := os.ReadFile("reach.log")
+	if err != nil {
+		panic(err)
+	}
+	strData := string(data)
+	lines := strings.Split(strData, "\n")
+
+	currentTest := ""
+	testsPerBlock := make(map[string][]string)
+	for _, line := range lines {
+		info := strings.Split(line, " ")
+		if info[0] == "T" {
+			currentTest = info[1]
+		} else if info[0] == "R" {
+			tests := testsPerBlock[info[1]]
+			testsPerBlock[info[1]] = append(tests, currentTest)
+		}
+	}
+
+	// expand blocks into mutations
+	for block := range testsPerBlock {
+		info := strings.Split(block, ":")
+		fileId, _ := strconv.ParseInt(info[0], 10, 64)
+		loc, _ := strconv.ParseInt(info[1], 10, 64)
+		file := i.Files[fileId]
+		fmt.Println(file.Path, loc, len(file.Mutations[token.Pos(loc)]))
+	}
+}
+
+func mutateAndRun(pkg string) {
 	i := Instrumenter{}
-	for _, p := range packageInfo()[1:] {
+	computed := false
+	for _, p := range packageInfo(pkg) {
 		shouldCompute := i.instrumentPackage(&p)
 		if !shouldCompute {
-			return
+			continue
 		}
-
-		// fmt.Println("computing mutation reach >> go test " + p.ImportPath)
-		// err := exec.Command("go", "test", p.ImportPath).Run()
-		// if err != nil {
-		// 	panic(err)
-		// }
-		// data, err := os.ReadFile("reach.log")
-		// if err != nil {
-		// 	panic(err)
-		// }
-		// strData := string(data)
-		// fmt.Print(strData)
+		fmt.Println("computing coverage >> go test " + p.ImportPath)
+		err := exec.Command("go", "test", p.ImportPath).Run()
+		computed = true
+		if err != nil {
+			panic(err)
+		}
+	}
+	if computed {
+		i.getMutations()
 	}
 }
 
 func main() {
-	var directory string
-	if len(os.Args) != 2 {
-		directory = "."
-	} else {
+	var directory, pkg string
+
+	switch len(os.Args) {
+	case 2:
 		directory = os.Args[1]
+	case 3:
+		directory = os.Args[1]
+		pkg = os.Args[2]
+	default:
+		directory = "."
 	}
 
 	// root directory of the project
-	atDir(directory, checkGolist)
+	atDir(directory, func() { checkGolist(pkg) })
 	path := copyProject(directory)
 	TMP_ROOT = path
 	// defer removeProjectCopy(path)
-	atDir(path, mutateAndRun)
+	atDir(path, func() { mutateAndRun(pkg) })
 	fmt.Println(path)
-
 }
