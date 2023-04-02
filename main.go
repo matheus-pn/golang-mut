@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
+	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,8 +26,16 @@ type PackageInfo struct {
 	ReachDefined bool
 }
 
+type Replacement struct {
+	Issuer string
+	Node   ast.Node // Original node that triggered the mutation
+	Stmt   ast.Stmt // Enclosing statement
+	NewStr string   // Statement source after mutation
+	OldStr string   // Statement source before mutation
+}
+
 type Mutator interface {
-	replacement(ast.Node) ast.Node
+	replacement(string, ast.Node, []ast.Node) *Replacement
 }
 
 type ChangeMode int
@@ -33,6 +46,12 @@ const (
 	SC_DELETE
 )
 
+type Mutation struct {
+	File   *FileInfo
+	Change *Replacement
+	Pos    token.Pos
+}
+
 type FileInfo struct {
 	Id      int
 	Path    string
@@ -41,7 +60,7 @@ type FileInfo struct {
 	AST     *ast.File
 	Imports map[string]bool
 	// Mutations per block
-	Mutations map[token.Pos][]ast.Node
+	Mutations map[token.Pos][]*Mutation
 	Changes   map[token.Pos]*SourceChange
 }
 
@@ -54,6 +73,7 @@ type SourceChange struct {
 }
 
 const (
+	MUTATION_NUMBER  = 1000
 	TMP_DIR          = "/tmp"
 	REACH_DEFINITION = `
 var __LOGFILE, _ = os.OpenFile("%s/reach.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0777)
@@ -89,25 +109,26 @@ var (
 	}
 	TMP_ROOT string
 	FLAGS    = map[string]string{
-		"verbose": "false",
+		"verbose": "true",
 	}
 )
 
-// FIXME: Use only packages.Load instead of go list
-func packageInfo(pkg string) []PackageInfo {
-	if pkg == "" {
-		pkg = "./..."
-	}
+// FIXME: Don't use an external command
+func packageInfo(cfg Config) []PackageInfo {
 	// Output will be a series of lines
 	// each line will have a semicolon separated list of:
 	// Dir ; ImportPath ; GoFiles ; TestGofiles
 	// GoFiles and TestGofiles are Comma Separated Values
-	Verbosef("EXEC go list -f {{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}} ./...\n")
-	out, err := exec.Command(
+
+	Verbosef("AT (%s) EXEC go list -f {{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}} ./...\n", TMP_ROOT)
+	cmd := exec.Command(
 		"go", "list", "-f",
 		"{{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}}",
-		pkg,
-	).Output()
+		cfg.Package,
+	)
+	cmd.Dir = TMP_ROOT
+	out, err := cmd.Output()
+
 	if err != nil {
 		panic(err)
 	}
@@ -134,18 +155,6 @@ func packageInfo(pkg string) []PackageInfo {
 	return infoList
 }
 
-func checkGolist(pkg string) {
-	if pkg == "" {
-		pkg = "."
-	}
-	Verbosef("EXEC go list .\n")
-	err := exec.Command("go", "list", pkg).Run()
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-}
-
 // Prints to stdout only if the global verbose flag is set
 func Verbosef(msg string, args ...interface{}) {
 	if FLAGS["verbose"] != "true" {
@@ -153,19 +162,6 @@ func Verbosef(msg string, args ...interface{}) {
 	}
 
 	fmt.Printf(msg, args...)
-}
-
-// Changes the current working directory to directory
-// Executes the callback function
-// Changes back to the previous working directory
-func atDir(directory string, callback func()) {
-	current, _ := exec.Command("pwd").Output()
-
-	Verbosef("CD %s\n", directory)
-	os.Chdir(directory)
-	callback()
-	Verbosef("CD %s\n", string(current))
-	os.Chdir(string(current))
 }
 
 // Copies directory to a temporary folder in /tmp/MUT-xxxxxx
@@ -189,9 +185,35 @@ func removeProjectCopy(directory string) {
 
 var ONE = ast.BasicLit{ValuePos: token.NoPos, Kind: token.INT, Value: "1"}
 
+func RootStmt(path []ast.Node) ast.Stmt {
+	for i := len(path) - 1; i >= 0; i-- {
+		node := path[i]
+		if stmt, ok := node.(ast.Stmt); ok {
+			return stmt
+		}
+	}
+	return nil
+}
+
 type UOIIncrementer struct{}
 
-func (UOIIncrementer) replacement(orig ast.Node) ast.Node {
+func MutationString(source string, stmt ast.Node, og ast.Node, new ast.Node) (string, string) {
+	writer := bytes.Buffer{}
+	fs := token.NewFileSet()
+	for i := stmt.Pos(); i < stmt.End(); i++ {
+		c := source[i]
+		if i == og.Pos() {
+			printer.Fprint(&writer, fs, new)
+			i = og.End() - 1
+		} else {
+			writer.WriteByte(c)
+		}
+	}
+
+	return source[stmt.Pos():stmt.End()], writer.String()
+}
+
+func (UOIIncrementer) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
 	node, ok := orig.(*ast.BasicLit)
 	if !ok {
 		return nil
@@ -200,12 +222,19 @@ func (UOIIncrementer) replacement(orig ast.Node) ast.Node {
 		return nil
 	}
 
-	return &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.ADD, Y: &ONE}
+	stmt := RootStmt(path)
+	if stmt == nil {
+		return nil
+	}
+
+	new := &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.ADD, Y: &ONE}
+	newStr, oldStr := MutationString(source, stmt, orig, new)
+	return &Replacement{"UOIIncrementer", orig, stmt, newStr, oldStr}
 }
 
 type UOIDecrementer struct{}
 
-func (UOIDecrementer) replacement(orig ast.Node) ast.Node {
+func (UOIDecrementer) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
 	node, ok := orig.(*ast.BasicLit)
 	if !ok {
 		return nil
@@ -214,44 +243,58 @@ func (UOIDecrementer) replacement(orig ast.Node) ast.Node {
 		return nil
 	}
 
-	return &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.SUB, Y: &ONE}
+	stmt := RootStmt(path)
+	if stmt == nil {
+		return nil
+	}
+
+	new := &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.SUB, Y: &ONE}
+	newStr, oldStr := MutationString(source, stmt, orig, new)
+	return &Replacement{"UOIDecrementer", orig, stmt, newStr, oldStr}
 }
 
-func operatorReplacement(orig ast.Node, op token.Token, newOp token.Token) ast.Node {
+func operatorReplacement(issuer string, source string, path []ast.Node, orig ast.Node, op token.Token, newOp token.Token) *Replacement {
 	node, ok := orig.(*ast.BinaryExpr)
 	if !ok || node.Op != op {
 		return nil
 	}
 
-	return &ast.BinaryExpr{X: node.X, OpPos: token.NoPos, Op: newOp, Y: node.Y}
+	stmt := RootStmt(path)
+	if stmt == nil {
+		return nil
+	}
+
+	new := &ast.BinaryExpr{X: node.X, OpPos: token.NoPos, Op: newOp, Y: node.Y}
+	newStr, oldStr := MutationString(source, stmt, orig, new)
+	return &Replacement{issuer, orig, stmt, newStr, oldStr}
 }
 
 type AORMinusToDiv struct{}
 
-func (AORMinusToDiv) replacement(orig ast.Node) ast.Node {
-	return operatorReplacement(orig, token.SUB, token.QUO)
+func (AORMinusToDiv) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORMinusToDiv", source, path, orig, token.SUB, token.QUO)
 }
 
 type AORModToAdd struct{}
 
-func (AORModToAdd) replacement(orig ast.Node) ast.Node {
-	return operatorReplacement(orig, token.REM, token.ADD)
+func (AORModToAdd) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORModToAdd", source, path, orig, token.REM, token.ADD)
 }
 
 type AORModToSub struct{}
 
-func (AORModToSub) replacement(orig ast.Node) ast.Node {
-	return operatorReplacement(orig, token.REM, token.SUB)
+func (AORModToSub) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORModToSub", source, path, orig, token.REM, token.SUB)
 }
 
 // func schemata[T any](toggle string, origEx T, replaceEx ...T) T {
 // 	return origEx
 // }
 
-func mutations(node ast.Node, mutators []Mutator) []ast.Node {
-	changes := []ast.Node{}
+func mutations(source string, node ast.Node, path []ast.Node, mutators []Mutator) []*Replacement {
+	changes := []*Replacement{}
 	for _, mut := range mutators {
-		change := mut.replacement(node)
+		change := mut.replacement(source, node, path)
 		if change != nil {
 			changes = append(changes, change)
 		}
@@ -293,28 +336,38 @@ func getParent(path []ast.Node) (ast.Node, token.Pos) {
 func (file *FileInfo) addInstrumentationGo() {
 	visited := make(map[ast.Node]bool)
 	path := []ast.Node{}
-	astWalk := func(node ast.Node) bool {
+	astWalk := func(node ast.Node) (ret bool) {
+		ret = true
+
 		if node == nil {
 			path = path[:len(path)-1]
-			return false
+			return
 		}
 		path = append(path, node)
 
-		// if this node has mutations we will instrument the enclosing block to check reachability at runtime
-		changes := mutations(node, DEFAULT_MUTATORS)
+		// If this node has mutations we will instrument the enclosing block to check reachability at runtime
+		changes := mutations(string(file.Source), node, path, DEFAULT_MUTATORS)
 		if len(changes) == 0 {
-			return true
+			return
 		}
 
 		parentNode, at := getParent(path)
 		if parentNode == nil {
-			return true
+			return
 		}
 
-		m := file.Mutations[parentNode.Pos()]
-		file.Mutations[parentNode.Pos()] = append(m, changes...)
+		// Here we append mutations to the parent block scope
+		muts := []*Mutation{}
+		for _, change := range changes {
+			// Add the mutation with the actual location
+			muts = append(muts, &Mutation{file, change, node.Pos()})
+		}
 
-		// block not already visited
+		// The mutation being scoped by parent block makes it easier to retrieve info later
+		m := file.Mutations[parentNode.Pos()]
+		file.Mutations[parentNode.Pos()] = append(m, muts...)
+
+		// Here we add the coverage code (only needs to be done once per block)
 		if !visited[parentNode] {
 			visited[parentNode] = true
 			// Create __reach("BLOCK_ID:FILEPATH") call
@@ -322,7 +375,7 @@ func (file *FileInfo) addInstrumentationGo() {
 
 			file.addSourceChange(&SourceChange{SC_APPEND, reach, parentNode.End()}, at)
 		}
-		return true
+		return
 	}
 	ast.Inspect(file.AST, astWalk)
 }
@@ -367,7 +420,7 @@ func (file *FileInfo) addInstrumentationTEST() {
 	ast.Inspect(file.AST, astWalk)
 }
 
-func (file *FileInfo) writeChanges(defineReach bool) {
+func (file *FileInfo) writeInstrumentation() {
 	if len(file.Changes) == 0 {
 		os.WriteFile(file.Path, []byte(file.Source), 0777)
 		return
@@ -383,12 +436,14 @@ func (file *FileInfo) writeChanges(defineReach bool) {
 			switch change.Mode {
 			case SC_APPEND:
 				fmt.Fprint(&writer, change.Code)
+			default:
+				panic("Invalid program state")
 			}
 		}
 		writer.WriteByte(file.Source[i])
 	}
 
-	if defineReach && !file.Package.ReachDefined {
+	if !file.Package.ReachDefined {
 		fmt.Fprintf(&writer, REACH_DEFINITION, TMP_ROOT)
 		file.Package.ReachDefined = true
 	}
@@ -398,13 +453,13 @@ func (file *FileInfo) writeChanges(defineReach bool) {
 }
 
 // Adds the __reach function on the file at goFilePath
-func (i *Instrumenter) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
+func (ft *FileTable) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 	var fs token.FileSet
 	var err error
 
 	file := FileInfo{
 		Path: path, Package: pack, Changes: make(map[token.Pos]*SourceChange),
-		Imports: make(map[string]bool), Mutations: make(map[token.Pos][]ast.Node),
+		Imports: make(map[string]bool), Mutations: make(map[token.Pos][]*Mutation),
 	}
 
 	file.Source, err = os.ReadFile(path)
@@ -421,106 +476,199 @@ func (i *Instrumenter) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 		file.Imports[spec.Path.Value] = true
 	}
 
-	file.Id = len(i.Files)
-	i.Files = append(i.Files, &file)
+	file.Id = len(ft.Files)
+	ft.Files = append(ft.Files, &file)
 	return &file
 }
 
-func (i *Instrumenter) instrumentPackage(p *PackageInfo) bool {
-	// FIXME: Check before copying project
-	if len(p.TestGoFiles) == 0 {
-		fmt.Printf("?\t%s\t[no test files]\n", p.ImportPath)
-		return false
-	} else if len(p.GoFiles) == 0 {
-		fmt.Printf("?\t%s\t[no .go files]\n", p.ImportPath)
-		return false
-	}
-
-	for _, source := range p.GoFiles {
-		file := i.NewFileInfo(p.Dir+"/"+source, p)
-		file.addInstrumentationGo()
-		file.writeChanges(true)
-	}
-	for _, source := range p.TestGoFiles {
-		file := i.NewFileInfo(p.Dir+"/"+source, p)
-		file.addInstrumentationTEST()
-		file.writeChanges(true)
-	}
-	return true
-}
-
-type Instrumenter struct {
+type FileTable struct {
 	Files []*FileInfo
 }
 
-func (i *Instrumenter) getMutations() {
-	data, err := os.ReadFile("reach.log")
-	if err != nil {
-		panic(err)
-	}
-	strData := string(data)
-	lines := strings.Split(strData, "\n")
+// Returns a map of (blockLocation => testLocations[])
+// blockLocation is the location of the parentBlock of one or more mutations
+func ParseCoverage(source string) map[NodeIdentifier][]NodeIdentifier {
+	var currentTest NodeIdentifier
 
-	currentTest := ""
-	testsPerBlock := make(map[string][]string)
-	for _, line := range lines {
+	testsPerBlock := make(map[NodeIdentifier][]NodeIdentifier)
+	for _, line := range strings.Split(source, "\n") {
 		info := strings.Split(line, " ")
-		if info[0] == "T" {
-			currentTest = info[1]
-		} else if info[0] == "R" {
-			tests := testsPerBlock[info[1]]
-			testsPerBlock[info[1]] = append(tests, currentTest)
-		}
-	}
-
-	// expand blocks into mutations
-	for block := range testsPerBlock {
-		info := strings.Split(block, ":")
-		fileId, _ := strconv.ParseInt(info[0], 10, 64)
-		loc, _ := strconv.ParseInt(info[1], 10, 64)
-		file := i.Files[fileId]
-		fmt.Println(file.Path, loc, len(file.Mutations[token.Pos(loc)]))
-	}
-}
-
-func mutateAndRun(pkg string) {
-	i := Instrumenter{}
-	computed := false
-	for _, p := range packageInfo(pkg) {
-		shouldCompute := i.instrumentPackage(&p)
-		if !shouldCompute {
+		// info[0] (Tag) = T or R
+		// info[1] (Node Identifier) = fileId:NodePos
+		if len(info) != 2 {
 			continue
 		}
-		fmt.Println("computing coverage >> go test " + p.ImportPath)
-		err := exec.Command("go", "test", p.ImportPath).Run()
-		computed = true
+
+		ident := strings.Split(info[1], ":")
+		if len(ident) != 2 {
+			fmt.Println("Malformed coverage data 2")
+			os.Exit(1)
+		}
+		fileId, _ := strconv.ParseInt(ident[0], 10, 64)
+		nodePos, _ := strconv.ParseInt(ident[1], 10, 64)
+
+		nodeIdentifier := NodeIdentifier{int(fileId), int(nodePos)}
+		if info[0] == "T" {
+			currentTest = nodeIdentifier
+		} else if info[0] == "R" {
+			testsPerBlock[nodeIdentifier] = append(testsPerBlock[nodeIdentifier], currentTest)
+		}
+	}
+	return testsPerBlock
+}
+
+type NodeIdentifier struct {
+	FileId  int
+	NodePos int
+}
+
+func GolangMut(cfg Config) {
+	var coverageData string = ""
+	ft := FileTable{}
+
+	// Get all packages at the cfg.Package path
+	packages := packageInfo(cfg)
+
+	// Use a given coverage file
+	if cfg.CoverageFile != "" {
+		coverage, err := os.ReadFile(cfg.CoverageFile)
+		coverageData = string(coverage)
 		if err != nil {
 			panic(err)
 		}
 	}
-	if computed {
-		i.getMutations()
+
+	if cfg.Nocov {
+		panic("not implemented")
+	}
+	// For each package, add their files to FileTable
+	for _, pkg := range packages {
+		// If the package has no tests, or is empty: skip
+		if len(pkg.TestGoFiles) == 0 {
+			fmt.Printf("?\t%s\t[no test files]\n", pkg.ImportPath)
+			continue
+		} else if len(pkg.GoFiles) == 0 {
+			fmt.Printf("?\t%s\t[no .go files]\n", pkg.ImportPath)
+			continue
+		}
+
+		// For each Source file
+		for _, source := range pkg.GoFiles {
+			file := ft.NewFileInfo(pkg.Dir+"/"+source, &pkg)
+			// Add instrumentation code to compute coverage
+			file.addInstrumentationGo()
+			file.writeInstrumentation()
+		}
+		for _, source := range pkg.TestGoFiles {
+			file := ft.NewFileInfo(pkg.Dir+"/"+source, &pkg)
+			// Add instrumentation code to compute coverage
+			file.addInstrumentationTEST()
+			file.writeInstrumentation()
+		}
+
+		// Bail if already has coverage data
+		if coverageData != "" {
+			continue
+		}
+
+		// Run tests of package to get coverage data
+		fmt.Println("computing coverage >> go test " + pkg.ImportPath)
+		err := exec.Command("go", "test", pkg.ImportPath).Run()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// If not provided with coverage file, ensure one was generated
+	if coverageData == "" {
+		reach, err := os.ReadFile(filepath.Join(TMP_ROOT, "reach.log"))
+		coverageData = string(reach)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// For each parent block of a mutation we have the tests that reached it
+	testsPerBlock := ParseCoverage(coverageData)
+
+	// Get all reachable mutations
+	reachableMutations := []*Mutation{}
+	for block := range testsPerBlock {
+		file := ft.Files[block.FileId]
+		reachableMutations = append(reachableMutations, file.Mutations[token.Pos(block.NodePos)]...)
+	}
+
+	// Select mutations a random fixed number of mutations
+	// https://doi.org/10.1109/ISSRE.2015.7381815
+	rand.Shuffle(len(reachableMutations), func(i, j int) {
+		reachableMutations[i], reachableMutations[j] = reachableMutations[j], reachableMutations[i]
+	})
+
+	slice := MUTATION_NUMBER
+	if len(reachableMutations) < MUTATION_NUMBER {
+		slice = len(reachableMutations)
+	}
+
+	selectedMutations := reachableMutations[:slice]
+
+	// Get all mutations :'D
+	allMutations := []*Mutation{}
+	for _, file := range ft.Files {
+		for _, muts := range file.Mutations {
+			allMutations = append(allMutations, muts...)
+		}
+	}
+	GenReport(allMutations, selectedMutations, reachableMutations)
+}
+
+func Mutation1(orig func(), mut func()) {
+	if _, ok := os.LookupEnv("Mutation1"); ok {
+		mut()
+	} else {
+		orig()
 	}
 }
 
-func main() {
-	var directory, pkg string
-
-	switch len(os.Args) {
-	case 2:
-		directory = os.Args[1]
-	case 3:
-		directory = os.Args[1]
-		pkg = os.Args[2]
-	default:
-		directory = "."
+func GenReport(all []*Mutation, selected []*Mutation, reachable []*Mutation) {
+	report := make(map[string]any)
+	report["totalMutations"] = len(all)
+	report["reachableMutations"] = len(reachable)
+	report["selectedMutations"] = len(selected)
+	countByIssuer := make(map[string]int)
+	for _, mut := range all {
+		Mutation1(func() { countByIssuer[mut.Change.Issuer] += 1 }, func() { countByIssuer[mut.Change.Issuer] += 1 + 1 })
 	}
 
-	// root directory of the project
-	atDir(directory, func() { checkGolist(pkg) })
-	path := copyProject(directory)
+	report["byOperator"] = countByIssuer
+	res, _ := json.Marshal(report)
+	fmt.Println(string(res))
+}
+
+type Config struct {
+	Directory    string
+	Package      string
+	CoverageFile string
+	Nocov        bool
+}
+
+var ROOT string
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+	config := Config{}
+
+	flag.BoolVar(&config.Nocov, "nocov", false, "skips getting coverage data")
+	flag.StringVar(&config.Directory, "directory", "../kubectl", "project directory")
+	flag.StringVar(&config.Package, "package", "./...", "package to run mutation analysis")
+	flag.StringVar(&config.CoverageFile, "coverage", "reach.log", "file with previously collected coverage data")
+	flag.Parse()
+
+	wd, _ := exec.Command("pwd").Output()
+	ROOT = string(wd)
+
+	path := copyProject(config.Directory)
 	TMP_ROOT = path
-	// defer removeProjectCopy(path)
-	atDir(path, func() { mutateAndRun(pkg) })
+	defer removeProjectCopy(path)
 	fmt.Println(path)
+	GolangMut(config)
 }
