@@ -18,14 +18,6 @@ import (
 	"time"
 )
 
-type PackageInfo struct {
-	Dir          string
-	ImportPath   string
-	GoFiles      []string
-	TestGoFiles  []string
-	ReachDefined bool
-}
-
 type Replacement struct {
 	Issuer string
 	Node   ast.Node // Original node that triggered the mutation
@@ -73,23 +65,7 @@ type SourceChange struct {
 }
 
 const (
-	MUTATION_NUMBER  = 1000
-	TMP_DIR          = "/tmp"
-	REACH_DEFINITION = `
-var __LOGFILE, _ = os.OpenFile("%s/reach.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0777)
-var __SET = make(map[string]bool)
-
-func __reach(msg string, flush bool) {
-	if !flush && __SET[msg] {
-		return
-	} else if !flush {
-		__SET[msg] = true
-	} else {
-		__SET = make(map[string]bool)
-	}
-	__LOGFILE.WriteString(msg+"\n")
-}
-`
+	MUTATION_NUMBER = 1000
 )
 
 // Yao, Xiangjuan; Harman, Mark; Jia, Yue  (2014).
@@ -112,48 +88,6 @@ var (
 		"verbose": "true",
 	}
 )
-
-// FIXME: Don't use an external command
-func packageInfo(cfg Config) []PackageInfo {
-	// Output will be a series of lines
-	// each line will have a semicolon separated list of:
-	// Dir ; ImportPath ; GoFiles ; TestGofiles
-	// GoFiles and TestGofiles are Comma Separated Values
-
-	Verbosef("AT (%s) EXEC go list -f {{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}} ./...\n", TMP_ROOT)
-	cmd := exec.Command(
-		"go", "list", "-f",
-		"{{.Dir}};{{.ImportPath}};{{range .GoFiles}}{{.}},{{end}};{{range .TestGoFiles}}{{.}},{{end}}",
-		cfg.Package,
-	)
-	cmd.Dir = TMP_ROOT
-	out, err := cmd.Output()
-
-	if err != nil {
-		panic(err)
-	}
-	lines := strings.Split(string(out), "\n")
-	// Ignore empty last line
-	lines = lines[:len(lines)-1]
-
-	infoList := []PackageInfo{}
-	for _, line := range lines {
-		fields := strings.Split(line, ";")
-		goFiles := strings.Split(fields[2], ",")
-		gotestFiles := strings.Split(fields[3], ",")
-
-		pack := PackageInfo{
-			fields[0],
-			fields[1],
-			// Ignore trailing comma
-			goFiles[:len(goFiles)-1],
-			gotestFiles[:len(gotestFiles)-1],
-			false,
-		}
-		infoList = append(infoList, pack)
-	}
-	return infoList
-}
 
 // Prints to stdout only if the global verbose flag is set
 func Verbosef(msg string, args ...interface{}) {
@@ -314,152 +248,17 @@ func (file *FileInfo) addSourceChange(sc *SourceChange, at token.Pos) {
 	file.Changes[at] = sc
 }
 
-func getParent(path []ast.Node) (ast.Node, token.Pos) {
-	for i := len(path) - 1; i >= 0; i-- {
-		node := path[i]
-		switch stmt := node.(type) {
-		case *ast.BlockStmt:
-			// Block is  a part of switch-like structure, add before instead
-			if i > 0 && isSpecialBlock(path[i-1]) {
-				continue
-			}
-			return stmt, stmt.Lbrace + 1
-		case *ast.CommClause:
-			return stmt, stmt.Colon + 1
-		case *ast.CaseClause:
-			return stmt, stmt.Colon + 1
-		}
-	}
-	return nil, 0
-}
-
-func (file *FileInfo) addInstrumentationGo() {
-	visited := make(map[ast.Node]bool)
-	path := []ast.Node{}
-	astWalk := func(node ast.Node) (ret bool) {
-		ret = true
-
-		if node == nil {
-			path = path[:len(path)-1]
-			return
-		}
-		path = append(path, node)
-
-		// If this node has mutations we will instrument the enclosing block to check reachability at runtime
-		changes := mutations(string(file.Source), node, path, DEFAULT_MUTATORS)
-		if len(changes) == 0 {
-			return
-		}
-
-		parentNode, at := getParent(path)
-		if parentNode == nil {
-			return
-		}
-
-		// Here we append mutations to the parent block scope
-		muts := []*Mutation{}
-		for _, change := range changes {
-			// Add the mutation with the actual location
-			muts = append(muts, &Mutation{file, change, node.Pos()})
-		}
-
-		// The mutation being scoped by parent block makes it easier to retrieve info later
-		m := file.Mutations[parentNode.Pos()]
-		file.Mutations[parentNode.Pos()] = append(m, muts...)
-
-		// Here we add the coverage code (only needs to be done once per block)
-		if !visited[parentNode] {
-			visited[parentNode] = true
-			// Create __reach("BLOCK_ID:FILEPATH") call
-			reach := fmt.Sprintf(`__reach("R %d:%d", false);`, file.Id, parentNode.Pos())
-
-			file.addSourceChange(&SourceChange{SC_APPEND, reach, parentNode.End()}, at)
-		}
-		return
-	}
-	ast.Inspect(file.AST, astWalk)
-}
-
-func (file *FileInfo) addInstrumentationTEST() {
-	astWalk := func(n ast.Node) bool {
-		if _, ok := n.(*ast.File); ok {
-			return true
-		}
-		if fun, ok := n.(*ast.FuncDecl); !ok || len(fun.Type.Params.List) < 1 {
-			return false
-		}
-		fun := n.(*ast.FuncDecl)
-		fields := fun.Type.Params.List
-		hasTest := false
-		for _, f := range fields {
-			e, ok := f.Type.(*ast.StarExpr)
-			if !ok {
-				continue
-			}
-			s, ok := e.X.(*ast.SelectorExpr)
-			if !ok {
-				continue
-			}
-			i, ok := s.X.(*ast.Ident)
-			if !ok {
-				continue
-			}
-			if i.Name == "testing" && s.Sel.Name == "T" {
-				hasTest = true
-				break
-			}
-		}
-		if hasTest {
-			reach := fmt.Sprintf(`__reach("T %d:%d", true)`, file.Id, fun.Pos())
-			// reach, _ := parser.ParseExpr(reachSrc)
-			// fun.Body.List = append([]ast.Stmt{&ast.ExprStmt{X: reach}}, fun.Body.List...)
-			file.addSourceChange(&SourceChange{SC_APPEND, reach, fun.Body.Rbrace + 1}, fun.Body.Lbrace+1)
-		}
-		return false
-	}
-	ast.Inspect(file.AST, astWalk)
-}
-
-func (file *FileInfo) writeInstrumentation() {
-	if len(file.Changes) == 0 {
-		os.WriteFile(file.Path, []byte(file.Source), 0777)
-		return
-	}
-
-	writer := bytes.Buffer{}
-	for i := 0; i < len(file.Source); i++ {
-		if i == int(file.AST.Name.End()) && !file.Imports[`"os"`] && !file.Package.ReachDefined {
-			fmt.Fprint(&writer, "\n"+`import "os"`)
-		}
-
-		if change, present := file.Changes[token.Pos(i)]; present {
-			switch change.Mode {
-			case SC_APPEND:
-				fmt.Fprint(&writer, change.Code)
-			default:
-				panic("Invalid program state")
-			}
-		}
-		writer.WriteByte(file.Source[i])
-	}
-
-	if !file.Package.ReachDefined {
-		fmt.Fprintf(&writer, REACH_DEFINITION, TMP_ROOT)
-		file.Package.ReachDefined = true
-	}
-
-	os.WriteFile(file.Path, writer.Bytes(), 0777)
-	file.Changes = nil
-}
-
 // Adds the __reach function on the file at goFilePath
 func (ft *FileTable) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 	var fs token.FileSet
 	var err error
 
 	file := FileInfo{
-		Path: path, Package: pack, Changes: make(map[token.Pos]*SourceChange),
-		Imports: make(map[string]bool), Mutations: make(map[token.Pos][]*Mutation),
+		Path:      path,
+		Package:   pack,
+		Changes:   make(map[token.Pos]*SourceChange),
+		Imports:   make(map[string]bool),
+		Mutations: make(map[token.Pos][]*Mutation),
 	}
 
 	file.Source, err = os.ReadFile(path)
@@ -479,10 +278,6 @@ func (ft *FileTable) NewFileInfo(path string, pack *PackageInfo) *FileInfo {
 	file.Id = len(ft.Files)
 	ft.Files = append(ft.Files, &file)
 	return &file
-}
-
-type FileTable struct {
-	Files []*FileInfo
 }
 
 // Returns a map of (blockLocation => testLocations[])
@@ -524,10 +319,8 @@ type NodeIdentifier struct {
 
 func GolangMut(cfg Config) {
 	var coverageData string = ""
-	ft := FileTable{}
-
 	// Get all packages at the cfg.Package path
-	packages := packageInfo(cfg)
+	packages := GetPackageInfo(cfg)
 
 	// Use a given coverage file
 	if cfg.CoverageFile != "" {
@@ -541,46 +334,18 @@ func GolangMut(cfg Config) {
 	if cfg.Nocov {
 		panic("not implemented")
 	}
-	// For each package, add their files to FileTable
-	for _, pkg := range packages {
-		// If the package has no tests, or is empty: skip
-		if len(pkg.TestGoFiles) == 0 {
-			fmt.Printf("?\t%s\t[no test files]\n", pkg.ImportPath)
-			continue
-		} else if len(pkg.GoFiles) == 0 {
-			fmt.Printf("?\t%s\t[no .go files]\n", pkg.ImportPath)
-			continue
-		}
 
-		// For each Source file
-		for _, source := range pkg.GoFiles {
-			file := ft.NewFileInfo(pkg.Dir+"/"+source, &pkg)
-			// Add instrumentation code to compute coverage
-			file.addInstrumentationGo()
-			file.writeInstrumentation()
-		}
-		for _, source := range pkg.TestGoFiles {
-			file := ft.NewFileInfo(pkg.Dir+"/"+source, &pkg)
-			// Add instrumentation code to compute coverage
-			file.addInstrumentationTEST()
-			file.writeInstrumentation()
-		}
-
-		// Bail if already has coverage data
-		if coverageData != "" {
-			continue
-		}
-
-		// Run tests of package to get coverage data
-		fmt.Println("computing coverage >> go test " + pkg.ImportPath)
-		err := exec.Command("go", "test", pkg.ImportPath).Run()
-		if err != nil {
-			panic(err)
-		}
-	}
-
+	ft := FileTable{}
 	// If not provided with coverage file, ensure one was generated
 	if coverageData == "" {
+		// For each package:
+		// - Add files to FileTable
+		// - Instrument files
+		// - Run go test
+		for _, pkg := range packages {
+			ft.InstrumentPackage(&pkg)
+		}
+
 		reach, err := os.ReadFile(filepath.Join(TMP_ROOT, "reach.log"))
 		coverageData = string(reach)
 		if err != nil {
@@ -618,7 +383,10 @@ func GolangMut(cfg Config) {
 			allMutations = append(allMutations, muts...)
 		}
 	}
+
 	GenReport(allMutations, selectedMutations, reachableMutations)
+	// Group selected mutations by statement
+	// mutationsPerStatement := map[*ast.Stmt][]*Mutation{}
 }
 
 func Mutation1(orig func(), mut func()) {

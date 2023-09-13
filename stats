@@ -1,0 +1,12 @@
+{
+    "byOperator": {
+        "AORMinusToDiv": 35,
+        "AORModToAdd": 1,
+        "AORModToSub": 1,
+        "UOIDecrementer": 1570,
+        "UOIIncrementer": 1570
+    },
+    "reachableMutations": 2410,
+    "selectedMutations": 1000,
+    "totalMutations": 3177
+}
