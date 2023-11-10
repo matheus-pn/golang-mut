@@ -58,9 +58,17 @@ func (ft *FileTable) InstrumentPackage(pkg *PackageInfo) {
 	}
 
 	// Run tests of package to get coverage data
-	fmt.Println("computing coverage >> go test " + pkg.ImportPath)
-	err := exec.Command("go", "test", pkg.ImportPath).Run()
+	Verbosef("computing coverage >> go test " + fmt.Sprintf("%s/%s", TMP_ROOT, pkg.ImportPath))
+	os.Chdir(TMP_ROOT)
+	out, err := exec.Command("pwd").Output()
+	if err == nil {
+		Verbosef("PWD " + string(out))
+	}
+	_, err = exec.Command("go", "test", pkg.ImportPath).Output()
 	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			fmt.Println(string(exit.Stderr))
+		}
 		panic(err)
 	}
 }
@@ -79,9 +87,9 @@ func (file *FileInfo) addInstrumentationGo() {
 
 		// If this node has mutations we will instrument the enclosing block to check reachability at runtime
 		changes := mutations(string(file.Source), node, path, DEFAULT_MUTATORS)
-		if len(changes) == 0 {
-			return
-		}
+		// if len(changes) == 0 {
+		// 	return
+		// }
 
 		parentNode, at := getParent(path)
 		if parentNode == nil {
@@ -92,7 +100,7 @@ func (file *FileInfo) addInstrumentationGo() {
 		muts := []*Mutation{}
 		for _, change := range changes {
 			// Add the mutation with the actual location
-			muts = append(muts, &Mutation{file, change, node.Pos()})
+			muts = append(muts, &Mutation{file, change, parentNode.Pos(), false})
 		}
 
 		// The mutation being scoped by parent block makes it easier to retrieve info later
@@ -123,6 +131,10 @@ func (file *FileInfo) addInstrumentationTEST() {
 		fun := n.(*ast.FuncDecl)
 		fields := fun.Type.Params.List
 		hasTest := false
+		// FIXME: REDUNDANT FOR
+		if len(fields) > 1 {
+			return false
+		}
 		for _, f := range fields {
 			e, ok := f.Type.(*ast.StarExpr)
 			if !ok {

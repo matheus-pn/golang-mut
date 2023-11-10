@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fatih/color"
 )
 
 type Replacement struct {
@@ -42,6 +45,7 @@ type Mutation struct {
 	File   *FileInfo
 	Change *Replacement
 	Pos    token.Pos
+	Alive  bool
 }
 
 type FileInfo struct {
@@ -76,16 +80,33 @@ const (
 // doi:10.1145/2568225.2568265
 var (
 	DEFAULT_MUTATORS = []Mutator{
+		// INLINE CONST: Increment or decrement const
 		UOIIncrementer{},
 		UOIDecrementer{},
 
+		// Math: Replace operation
+		// AORModToAdd{},
+		// AORModToSub{},
+		AORDivToMult{},
+		AORMultToSub{},
+		AORMultToPlus{},
+		AORPlusToMod{},
 		AORMinusToDiv{},
-		AORModToAdd{},
-		AORModToSub{},
+
+		// Logic: Change connector
+		LCRAndToOr{},
+		LCROrToAnd{},
+
+		// Comparison
+		RORNeqToLeq{},
+		RORLeqToNeq{},
+		RORNeqToLeq{},
+		ROREqToNeq{},
+		RORLtToNeq{},
 	}
 	TMP_ROOT string
 	FLAGS    = map[string]string{
-		"verbose": "true",
+		"verbose": "false",
 	}
 )
 
@@ -162,7 +183,7 @@ func (UOIIncrementer) replacement(source string, orig ast.Node, path []ast.Node)
 	}
 
 	new := &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.ADD, Y: &ONE}
-	newStr, oldStr := MutationString(source, stmt, orig, new)
+	oldStr, newStr := MutationString(source, stmt, orig, new)
 	return &Replacement{"UOIIncrementer", orig, stmt, newStr, oldStr}
 }
 
@@ -183,7 +204,7 @@ func (UOIDecrementer) replacement(source string, orig ast.Node, path []ast.Node)
 	}
 
 	new := &ast.BinaryExpr{X: node, OpPos: token.NoPos, Op: token.SUB, Y: &ONE}
-	newStr, oldStr := MutationString(source, stmt, orig, new)
+	oldStr, newStr := MutationString(source, stmt, orig, new)
 	return &Replacement{"UOIDecrementer", orig, stmt, newStr, oldStr}
 }
 
@@ -199,7 +220,7 @@ func operatorReplacement(issuer string, source string, path []ast.Node, orig ast
 	}
 
 	new := &ast.BinaryExpr{X: node.X, OpPos: token.NoPos, Op: newOp, Y: node.Y}
-	newStr, oldStr := MutationString(source, stmt, orig, new)
+	oldStr, newStr := MutationString(source, stmt, orig, new)
 	return &Replacement{issuer, orig, stmt, newStr, oldStr}
 }
 
@@ -219,6 +240,96 @@ type AORModToSub struct{}
 
 func (AORModToSub) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
 	return operatorReplacement("AORModToSub", source, path, orig, token.REM, token.SUB)
+}
+
+type AORMinusToPlus struct{}
+
+func (AORMinusToPlus) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORMinusToPlus", source, path, orig, token.SUB, token.ADD)
+}
+
+type AORPlusToMod struct{}
+
+func (AORPlusToMod) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORPlusToMod", source, path, orig, token.ADD, token.REM)
+}
+
+type AORMinusToMult struct{}
+
+func (AORMinusToMult) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORMinusToMult", source, path, orig, token.SUB, token.MUL)
+}
+
+type AORDivToMult struct{}
+
+func (AORDivToMult) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORDivToMult", source, path, orig, token.QUO, token.MUL)
+}
+
+type AORMultToPlus struct{}
+
+func (AORMultToPlus) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORMultToPlus", source, path, orig, token.MUL, token.ADD)
+}
+
+type AORMultToSub struct{}
+
+func (AORMultToSub) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORMultToSub", source, path, orig, token.MUL, token.SUB)
+}
+
+type AORDivToMod struct{}
+
+func (AORDivToMod) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORDivToMod", source, path, orig, token.QUO, token.REM)
+}
+
+type AORPlusToDiv struct{}
+
+func (AORPlusToDiv) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("AORPlusToDiv", source, path, orig, token.ADD, token.QUO)
+}
+
+type LCRAndToOr struct{}
+
+func (LCRAndToOr) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("LCRAndToOr", source, path, orig, token.LAND, token.LOR)
+}
+
+type LCROrToAnd struct{}
+
+func (LCROrToAnd) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("LCROrToAnd", source, path, orig, token.LOR, token.LAND)
+}
+
+type RORNeqToLeq struct{}
+
+func (RORNeqToLeq) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("RORNeqToLeq", source, path, orig, token.NEQ, token.LEQ)
+}
+
+type RORLeqToNeq struct{}
+
+func (RORLeqToNeq) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("RORLeqToNeq", source, path, orig, token.LEQ, token.NEQ)
+}
+
+type RORNeqToGeq struct{}
+
+func (RORNeqToGeq) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("RORNeqToGeq", source, path, orig, token.NEQ, token.GEQ)
+}
+
+type ROREqToNeq struct{}
+
+func (ROREqToNeq) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("ROREqToNeq", source, path, orig, token.EQL, token.NEQ)
+}
+
+type RORLtToNeq struct{}
+
+func (RORLtToNeq) replacement(source string, orig ast.Node, path []ast.Node) *Replacement {
+	return operatorReplacement("RORLtToNeq", source, path, orig, token.LSS, token.NEQ)
 }
 
 // func schemata[T any](toggle string, origEx T, replaceEx ...T) T {
@@ -385,16 +496,91 @@ func GolangMut(cfg Config) {
 	}
 
 	GenReport(allMutations, selectedMutations, reachableMutations)
+	WriteAndExecute(&ft, testsPerBlock, selectedMutations)
 	// Group selected mutations by statement
 	// mutationsPerStatement := map[*ast.Stmt][]*Mutation{}
 }
 
-func Mutation1(orig func(), mut func()) {
-	if _, ok := os.LookupEnv("Mutation1"); ok {
-		mut()
-	} else {
-		orig()
+func (file *FileInfo) Reset() {
+	file.Changes = make(map[token.Pos]*SourceChange)
+	os.WriteFile(file.Path, []byte(file.Source), 0777)
+}
+
+func (m *Mutation) Identifier() NodeIdentifier {
+	return NodeIdentifier{m.File.Id, int(m.Pos)}
+}
+
+func GetTestName(ft *FileTable, test NodeIdentifier) string {
+	name := []byte{}
+	index := test.NodePos + 5
+	source := ft.Files[test.FileId].Source
+	current := source[index]
+	for token.IsIdentifier(string(current)) {
+		name = append(name, current)
+		index = index + 1
+		current = source[index]
 	}
+	return string(name)
+}
+
+func (m *Mutation) Write() {
+	file := m.File
+
+	writer := bytes.Buffer{}
+	writer.WriteString(string(file.Source[0:m.Change.Stmt.Pos()]))
+	writer.WriteString(m.Change.NewStr)
+	writer.WriteString(string(file.Source[m.Change.Stmt.End():len(file.Source)]))
+
+	os.WriteFile(file.Path, writer.Bytes(), 0777)
+}
+
+func WriteAndExecute(ft *FileTable, testsPerBlock map[NodeIdentifier][]NodeIdentifier, selected []*Mutation) {
+	// Undo the instrumentation
+	for _, file := range ft.Files {
+		file.Reset()
+	}
+
+	for _, mutation := range selected {
+		mutation.Alive = true
+		mutation.Write()
+		tests := testsPerBlock[mutation.Identifier()]
+		// fmt.Println(len(tests))
+		for _, test := range tests {
+			testName := GetTestName(ft, test)
+			file := ft.Files[test.FileId]
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			fmt.Println("go test " + file.Package.ImportPath + " -run " + testName)
+			err := exec.CommandContext(ctx, "go", "test", file.Package.ImportPath, "-run", testName).Run()
+			if ctx.Err() != nil {
+				fmt.Println("SKIP, Test Timed out")
+				continue
+			}
+			if err != nil {
+
+				mutation.Alive = false
+				fmt.Println("Mutant Killed!")
+				break
+			}
+		}
+		if mutation.Alive {
+			fmt.Println("MUTANT SURVIVED: " + mutation.Change.Issuer + ", " + mutation.File.Path)
+			color.Red(mutation.Change.OldStr)
+			color.Green(mutation.Change.NewStr)
+		}
+	}
+
+	dead := 0
+	total := len(selected)
+	for _, mutant := range selected {
+		if !mutant.Alive {
+			dead += 1
+		}
+	}
+
+	fmt.Println("")
+	color.Yellow("MUTATION SCORE: %v%", dead*100/total)
 }
 
 func GenReport(all []*Mutation, selected []*Mutation, reachable []*Mutation) {
@@ -404,7 +590,7 @@ func GenReport(all []*Mutation, selected []*Mutation, reachable []*Mutation) {
 	report["selectedMutations"] = len(selected)
 	countByIssuer := make(map[string]int)
 	for _, mut := range all {
-		Mutation1(func() { countByIssuer[mut.Change.Issuer] += 1 }, func() { countByIssuer[mut.Change.Issuer] += 1 + 1 })
+		countByIssuer[mut.Change.Issuer] += 1
 	}
 
 	report["byOperator"] = countByIssuer
@@ -426,9 +612,9 @@ func main() {
 	config := Config{}
 
 	flag.BoolVar(&config.Nocov, "nocov", false, "skips getting coverage data")
-	flag.StringVar(&config.Directory, "directory", "../kubectl", "project directory")
+	flag.StringVar(&config.Directory, "directory", "/home/matheus/Projects/golang-reference/", "project directory")
 	flag.StringVar(&config.Package, "package", "./...", "package to run mutation analysis")
-	flag.StringVar(&config.CoverageFile, "coverage", "reach.log", "file with previously collected coverage data")
+	flag.StringVar(&config.CoverageFile, "coverage", "", "file with previously collected coverage data")
 	flag.Parse()
 
 	wd, _ := exec.Command("pwd").Output()
@@ -436,7 +622,7 @@ func main() {
 
 	path := copyProject(config.Directory)
 	TMP_ROOT = path
-	defer removeProjectCopy(path)
+	// defer removeProjectCopy(path)
 	fmt.Println(path)
 	GolangMut(config)
 }

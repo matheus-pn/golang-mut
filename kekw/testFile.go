@@ -29,7 +29,7 @@ func Switch(n int) {
 
 func Switch2(n string) {
 	switch n {
-	case "qiwe":
+	case "something":
 	default:
 		fmt.Println(0)
 	}
@@ -37,7 +37,7 @@ func Switch2(n string) {
 
 func Switch3(n string) {
 	switch n {
-	case "qiwe":
+	case "somethingelse":
 	default:
 		if true {
 			fmt.Println(0)
